@@ -9,6 +9,7 @@ dependencies = [
   "mediapy>=1.2.4",
   "openpi-client",
   "isaaclab[all,isaacsim]==2.2.0",
+  "mujoco>=3.2.0",
   "tyro>=0.9.17",
   "websockets>=16.0",
 ]

@@ -63,6 +63,11 @@ Finally, run the evaluation script:
 python run_eval.py --episodes [INT] --scene [INT] --headless
 ```
 
+To run the MuJoCo version instead of IsaacLab, pass the backend flag:
+```bash
+python run_eval.py --backend mujoco --episodes [INT] --scene [INT] --headless
+```
+
 ## Minimal Example
 
 ```python

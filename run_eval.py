@@ -35,29 +35,51 @@ def main(
         episodes:int = 10,
         headless: bool = True,
         scene: int = 1,
+        backend: str = "isaac",
         ):
-    # launch omniverse app with arguments (inside function to prevent overriding tyro)
-    from isaaclab.app import AppLauncher
-    parser = argparse.ArgumentParser(description="Tutorial on creating an empty stage.")
-    AppLauncher.add_app_launcher_args(parser)
-    args_cli, _ = parser.parse_known_args()
-    args_cli.enable_cameras = True
-    args_cli.headless = headless
-    app_launcher = AppLauncher(args_cli)
-    simulation_app = app_launcher.app
+    backend = backend.lower()
 
-    # All IsaacLab dependent modules should be imported after the app is launched
+    simulation_app = None
+    args_cli = None
+
+    # Launch Omniverse only for IsaacLab.
+    if backend == "isaac":
+        from isaaclab.app import AppLauncher
+
+        parser = argparse.ArgumentParser(description="DROID evaluation runner")
+        AppLauncher.add_app_launcher_args(parser)
+        args_cli, _ = parser.parse_known_args()
+        args_cli.enable_cameras = True
+        args_cli.headless = headless
+        app_launcher = AppLauncher(args_cli)
+        simulation_app = app_launcher.app
+
+    if backend not in {"isaac", "mujoco"}:
+        raise ValueError(f"Unsupported backend: {backend}. Use 'isaac' or 'mujoco'.")
+
     import sim_evals.environments # noqa: F401
-    from isaaclab_tasks.utils import parse_env_cfg
 
+    if backend == "isaac":
+        from isaaclab_tasks.utils import parse_env_cfg
 
-    # Initialize the env
-    env_cfg = parse_env_cfg(
-        "DROID",
-        device=args_cli.device,
-        num_envs=1,
-        use_fabric=True,
-    )
+        env_cfg = parse_env_cfg(
+            "DROID",
+            device=args_cli.device,
+            num_envs=1,
+            use_fabric=True,
+        )
+        env_id = "DROID"
+    else:
+        try:
+            from sim_evals.environments.mujoco_droid import MujocoDroidEnvCfg
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "MuJoCo backend selected but 'mujoco' is not installed. Run 'uv sync' to install project dependencies."
+            ) from exc
+
+        env_cfg = MujocoDroidEnvCfg()
+        env_id = "DROID_MUJOCO"
+
     instruction = None
     match scene:
         case 1:
@@ -70,7 +92,7 @@ def main(
             raise ValueError(f"Scene {scene} not supported")
         
     env_cfg.set_scene(scene)
-    env = gym.make("DROID", cfg=env_cfg)
+    env = gym.make(env_id, cfg=env_cfg)
 
     obs, _ = env.reset()
     obs, _ = env.reset() # need second render cycle to get correctly loaded materials
@@ -104,7 +126,8 @@ def main(
             video = []
 
     env.close()
-    simulation_app.close()
+    if simulation_app is not None:
+        simulation_app.close()
 
 if __name__ == "__main__":
     args = tyro.cli(main)
