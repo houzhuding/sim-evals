@@ -5,10 +5,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from dataclasses import dataclass
+from typing import Any
 import gymnasium as gym
 from gymnasium import spaces
 import mujoco
 import numpy as np
+import torch
 
 
 # Load MJCF XML from external file
@@ -39,6 +41,23 @@ class MujocoDroidEnv(gym.Env):
         self.model.opt.timestep = 1.0 / (15.0 * float(self.cfg.frame_skip))
         self.data = mujoco.MjData(self.model)
         self.renderer = mujoco.Renderer(self.model, width=self.cfg.width, height=self.cfg.height)
+
+        # Cameras matching nvidia_droid environment config (OpenGL convention -> wxyz)
+        self.renderer.add_camera(
+            name="external_cam", height=720, width=1280,
+            pos=(0.05, 0.57, 0.66),
+            quat=(0.805, -0.393, -0.195, 0.399),
+        )
+        self.renderer.add_camera(
+            name="external_cam_2", height=720, width=1280,
+            pos=(0.05, -0.57, 0.66),
+            quat=(-0.393, 0.805, 0.399, -0.195),
+        )
+        self.renderer.add_camera(
+            name="wrist_cam", height=720, width=1280,
+            pos=(0.011, -0.031, -0.074),
+            quat=(-0.409, -0.420, 0.570, 0.576),
+        )
 
         self.default_qpos = np.array(
             [
@@ -177,29 +196,3 @@ class MujocoDroidEnv(gym.Env):
         if hasattr(self, "renderer") and self.renderer is not None:
             self.renderer.close()
             self.renderer = None
-
-    # Define cameras in code
-    self.cameras = {
-        "external_cam": {
-            "height": 720,
-            "width": 1280,
-            "pos": (0.05, 0.57, 0.66),
-            "quat": (-0.393, -0.195, 0.399, 0.805),
-        },
-        "external_cam_2": {
-            "height": 720,
-            "width": 1280,
-            "pos": (0.1, 0.6, 0.7),
-            "quat": (-0.4, -0.2, 0.4, 0.8),
-        },
-    }
-
-    # Initialize cameras in the renderer
-    for cam_name, cam_cfg in self.cameras.items():
-        self.renderer.add_camera(
-            name=cam_name,
-            height=cam_cfg["height"],
-            width=cam_cfg["width"],
-            pos=cam_cfg["pos"],
-            quat=cam_cfg["quat"],
-        )

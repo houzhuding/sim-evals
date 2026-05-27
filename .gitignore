@@ -2,6 +2,11 @@
 data/
 runs/
 assets/
+viz_output/
+viz_output/**/*.png
+viz_output/**/*.jpg
+viz_output/**/*.jpeg
+viz_output/**/*.mp4
 
 
 
