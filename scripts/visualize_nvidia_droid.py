@@ -16,7 +16,7 @@ from pathlib import Path
 
 parser = argparse.ArgumentParser(description="Visualize NVIDIA DROID environment")
 parser.add_argument("--device", type=str, default="cpu", help="Device to run on (cpu, cuda, cuda:0)")
-parser.add_argument("--scene", type=int, default=1, help="Scene ID (1-3)")
+parser.add_argument("--scene", type=int, default=1, help="Scene ID (1-4)")
 parser.add_argument("--headless", action="store_true", help="Headless mode: save camera images instead of viewer")
 parser.add_argument("--steps", type=int, default=0, help="Number of steps to run (0 = run until you close the window)")
 parser.add_argument("--output_dir", type=str, default="viz_output", help="Output directory for camera images")

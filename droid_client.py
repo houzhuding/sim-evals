@@ -1,0 +1,580 @@
+#!/usr/bin/env python3
+"""Run NVIDIA DROID simulation against a remote AR-DROID policy server.
+
+The server is expected to expose the roboarena websocket interface configured by
+``droid_server.py``: two external cameras, one wrist camera, joint position
+state, and joint-position action chunks.
+"""
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import importlib
+import logging
+import signal
+import time
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from tqdm import tqdm
+import websockets.sync.client
+
+from openpi_client import msgpack_numpy
+
+
+DEFAULT_PROMPTS = {
+    1: "put the cube in the bowl",
+    2: "put the can in the mug",
+    3: "put banana in the bin",
+    4: "pick up the blue peg and insert it into the orange hole, using small wiggle motions to align and seat it fully",
+}
+RELATIVE_FRAME_OFFSETS = [-23, -16, -8, 0]
+
+
+class SimDroidPolicyClient:
+    """Small stateful client that buffers action chunks from the websocket server."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        prompt: str,
+        open_loop_horizon: int = 24,
+    ) -> None:
+        self.client = RoboarenaWebsocketClient(host=host, port=port)
+        self.prompt = prompt
+        self.open_loop_horizon = int(open_loop_horizon)
+        self.session_id = str(uuid.uuid4())
+        self.pred_action_chunk: np.ndarray | None = None
+        self.actions_from_chunk_completed = 0
+        self.obs_history: list[dict[str, Any]] = []
+
+        metadata = self.client.get_server_metadata()
+        logging.info("Server metadata: %s", metadata)
+        self._validate_server_config(metadata)
+
+    def _validate_server_config(self, server_config: dict[str, Any]) -> None:
+        if server_config.get("n_external_cameras") != 2:
+            raise ValueError(
+                f"Expected server with 2 external cameras, got "
+                f"{server_config.get('n_external_cameras')}"
+            )
+        if not server_config.get("needs_wrist_camera"):
+            raise ValueError("Expected server with wrist camera enabled")
+        if server_config.get("action_space") != "joint_position":
+            raise ValueError(
+                f"Expected joint_position action space, got "
+                f"{server_config.get('action_space')}"
+            )
+
+    def reset(self) -> None:
+        self.actions_from_chunk_completed = 0
+        self.pred_action_chunk = None
+        self.obs_history = []
+        self.session_id = str(uuid.uuid4())
+        self.client.reset()
+
+    def close(self) -> None:
+        self.client.close()
+
+    def infer(self, sim_obs: dict[str, Any]) -> dict[str, np.ndarray]:
+        """Return one action for the current simulation observation."""
+        self.obs_history.append(extract_server_fields(sim_obs))
+        history_limit = max(abs(min(RELATIVE_FRAME_OFFSETS)) + 1, self.open_loop_horizon + 1)
+        if len(self.obs_history) > history_limit:
+            self.obs_history = self.obs_history[-history_limit:]
+        if (
+            self.pred_action_chunk is None
+            or self.actions_from_chunk_completed >= self.open_loop_horizon
+            or self.actions_from_chunk_completed >= len(self.pred_action_chunk)
+        ):
+            request = make_server_observation(
+                self._select_request_frames(),
+                prompt=self.prompt,
+                session_id=self.session_id,
+            )
+            t0 = time.time()
+            response = self.client.infer(request)
+            dt = time.time() - t0
+            self.pred_action_chunk = extract_action_chunk(response)
+            self.actions_from_chunk_completed = 0
+            logging.info(
+                "Received action chunk %s in %.2fs, range [%.4f, %.4f]",
+                self.pred_action_chunk.shape,
+                dt,
+                float(self.pred_action_chunk.min()),
+                float(self.pred_action_chunk.max()),
+            )
+
+        action = self.pred_action_chunk[self.actions_from_chunk_completed].astype(
+            np.float32
+        )
+        self.actions_from_chunk_completed += 1
+
+        action[-1] = 1.0 if action[-1] > 0.5 else 0.0
+        return {"action": action, "viz": make_viz_image(sim_obs)}
+
+    def _select_request_frames(self) -> list[dict[str, Any]]:
+        if self.pred_action_chunk is None:
+            return [self.obs_history[-1]]
+
+        anchor = len(self.obs_history) - 1
+        return [
+            self.obs_history[max(anchor + offset, 0)]
+            for offset in RELATIVE_FRAME_OFFSETS
+        ]
+
+
+class RoboarenaWebsocketClient:
+    """Minimal client for eval_utils.policy_server's endpoint-routed protocol."""
+
+    def __init__(self, host: str, port: int) -> None:
+        self._uri = f"ws://{host}:{port}"
+        self._packer = msgpack_numpy.Packer()
+        self._ws, self._server_metadata = self._wait_for_server()
+
+    def get_server_metadata(self) -> dict[str, Any]:
+        return self._server_metadata
+
+    def infer(self, obs: dict[str, Any]) -> Any:
+        request = dict(obs)
+        request["endpoint"] = "infer"
+        self._ws.send(self._packer.pack(request))
+        response = self._ws.recv()
+        if isinstance(response, str):
+            raise RuntimeError(f"Error in inference server:\n{response}")
+        return msgpack_numpy.unpackb(response)
+
+    def reset(self) -> None:
+        self._ws.send(self._packer.pack({"endpoint": "reset"}))
+        try:
+            response = self._ws.recv(timeout=5)
+        except TimeoutError:
+            logging.warning("Timed out waiting for reset acknowledgment; continuing.")
+            return
+        if isinstance(response, str):
+            raise RuntimeError(f"Error resetting inference server:\n{response}")
+
+    def close(self) -> None:
+        try:
+            self._ws.close()
+        except Exception:
+            logging.debug("Ignoring websocket close error", exc_info=True)
+
+    def _wait_for_server(self) -> tuple[websockets.sync.client.ClientConnection, dict[str, Any]]:
+        logging.info("Waiting for server at %s...", self._uri)
+        while True:
+            try:
+                conn = websockets.sync.client.connect(
+                    self._uri,
+                    compression=None,
+                    max_size=None,
+                    ping_interval=60,
+                    ping_timeout=600,
+                )
+                metadata = msgpack_numpy.unpackb(conn.recv())
+                return conn, metadata
+            except ConnectionRefusedError:
+                logging.info("Still waiting for server...")
+                time.sleep(5)
+
+
+def tensor_image_to_numpy(value: Any) -> np.ndarray:
+    """Convert an Isaac/MuJoCo image tensor shaped (1, H, W, C) to uint8 RGB."""
+    if is_torch_tensor(value):
+        image = value[0].detach().cpu().numpy()
+    else:
+        image = np.asarray(value)[0]
+
+    if image.dtype != np.uint8:
+        image = np.asarray(image, dtype=np.float32)
+        if image.size and image.max() <= 1.0:
+            image = image * 255.0
+        image = np.clip(image, 0, 255).astype(np.uint8)
+    return image
+
+
+def tensor_state_to_numpy(value: Any) -> np.ndarray:
+    if is_torch_tensor(value):
+        return value.detach().cpu().numpy().astype(np.float32)
+    return np.asarray(value, dtype=np.float32)
+
+
+def is_torch_tensor(value: Any) -> bool:
+    try:
+        import torch
+    except ModuleNotFoundError:
+        return False
+    return torch.is_tensor(value)
+
+
+def extract_server_fields(sim_obs: dict[str, Any]) -> dict[str, Any]:
+    policy_obs = sim_obs["policy"]
+    return {
+        "observation/exterior_image_0_left": tensor_image_to_numpy(
+            policy_obs["external_cam"]
+        ),
+        "observation/exterior_image_1_left": tensor_image_to_numpy(
+            policy_obs["external_cam_2"]
+        ),
+        "observation/wrist_image_left": tensor_image_to_numpy(policy_obs["wrist_cam"]),
+        "observation/joint_position": tensor_state_to_numpy(
+            policy_obs["arm_joint_pos"]
+        ),
+        "observation/cartesian_position": np.zeros(6, dtype=np.float32),
+        "observation/gripper_position": tensor_state_to_numpy(
+            policy_obs["gripper_pos"]
+        ),
+    }
+
+
+def make_server_observation(
+    frame_obs: list[dict[str, Any]],
+    prompt: str,
+    session_id: str,
+) -> dict[str, Any]:
+    current_obs = frame_obs[-1]
+    request = {
+        "endpoint": "infer",
+        "observation/joint_position": current_obs["observation/joint_position"],
+        "observation/cartesian_position": np.zeros(6, dtype=np.float32),
+        "observation/gripper_position": current_obs["observation/gripper_position"],
+        "prompt": prompt,
+        "session_id": session_id,
+    }
+
+    for image_key in (
+        "observation/exterior_image_0_left",
+        "observation/exterior_image_1_left",
+        "observation/wrist_image_left",
+    ):
+        images = [obs[image_key] for obs in frame_obs]
+        request[image_key] = images[0] if len(images) == 1 else np.stack(images, axis=0)
+
+    return request
+
+
+def extract_action_chunk(response: Any) -> np.ndarray:
+    """Normalize supported server response shapes to (T, 8)."""
+    if isinstance(response, dict):
+        if "actions" in response:
+            response = response["actions"]
+        elif "action" in response:
+            response = response["action"]
+
+    actions = np.asarray(response, dtype=np.float32)
+    if actions.ndim == 1:
+        actions = actions[None]
+    if actions.ndim != 2 or actions.shape[-1] != 8:
+        raise ValueError(f"Expected action chunk shaped (T, 8), got {actions.shape}")
+    return actions
+
+
+def make_viz_image(sim_obs: dict[str, Any]) -> np.ndarray:
+    policy_obs = sim_obs["policy"]
+    frames = [
+        tensor_image_to_numpy(policy_obs["external_cam"]),
+        tensor_image_to_numpy(policy_obs["external_cam_2"]),
+        tensor_image_to_numpy(policy_obs["wrist_cam"]),
+    ]
+    min_h = min(frame.shape[0] for frame in frames)
+    if any(frame.shape[0] != min_h for frame in frames):
+        import cv2
+
+        frames = [
+            cv2.resize(
+                frame,
+                (int(frame.shape[1] * min_h / frame.shape[0]), min_h),
+                interpolation=cv2.INTER_AREA,
+            )
+            for frame in frames
+        ]
+    return np.concatenate(frames, axis=1)
+
+
+def configure_camera_resolution(env_cfg: Any, width: int, height: int) -> None:
+    for cam_name in ("external_cam", "external_cam_2", "wrist_cam"):
+        cam_cfg = getattr(env_cfg.scene, cam_name, None)
+        if cam_cfg is None:
+            continue
+        cam_cfg.width = width
+        cam_cfg.height = height
+
+
+def resolve_device(requested_device: str) -> str:
+    if not requested_device.startswith("cuda"):
+        return requested_device
+
+    try:
+        import torch
+    except ModuleNotFoundError:
+        return "cpu"
+
+    if not torch.cuda.is_available():
+        logging.warning("CUDA requested but unavailable. Falling back to CPU.")
+        return "cpu"
+
+    major, minor = torch.cuda.get_device_capability()
+    device_arch = f"sm_{major}{minor}"
+    supported_arches = set(torch.cuda.get_arch_list())
+    if supported_arches and device_arch not in supported_arches:
+        logging.warning(
+            "CUDA arch %s is not supported by this PyTorch build (%s). "
+            "Falling back to CPU.",
+            device_arch,
+            sorted(supported_arches),
+        )
+        return "cpu"
+
+    return requested_device
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run NVIDIA DROID sim with a remote AR-DROID websocket policy."
+    )
+    parser.add_argument("--port", type=int, default=50532, help="Policy server port")
+    parser.add_argument("--episodes", type=int, default=1, help="Number of rollouts")
+    parser.add_argument("--scene", type=int, default=1, choices=[1, 2, 3, 4])
+    parser.add_argument("--headless", action="store_true", help="Run without GUI")
+    parser.add_argument(
+        "--prompt",
+        default=None,
+        help="Language instruction. Defaults to the standard prompt for --scene.",
+    )
+    parser.add_argument(
+        "--open-loop-horizon",
+        type=int,
+        default=24,
+        help="Number of returned chunk actions to execute before querying again.",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Optional per-episode step cap. Defaults to env max_episode_length.",
+    )
+    parser.add_argument(
+        "--cam-width",
+        type=int,
+        default=320,
+        help="Rendered camera width sent to the policy server.",
+    )
+    parser.add_argument(
+        "--cam-height",
+        type=int,
+        default=180,
+        help="Rendered camera height sent to the policy server.",
+    )
+    parser.add_argument(
+        "--video-dir",
+        type=Path,
+        default=None,
+        help="Directory for rollout videos. Defaults to runs/<date>/<time>.",
+    )
+    parser.add_argument(
+        "--no-save-video",
+        action="store_true",
+        help="Disable writing rollout videos.",
+    )
+    parser.add_argument(
+        "--pre-infer-view-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "Before inference starts, keep the Isaac Sim viewer interactive for this many "
+            "seconds so you can adjust camera/viewpoint (only when not headless)."
+        ),
+    )
+    args, _ = parser.parse_known_args()
+    return args
+
+
+def wait_for_view_adjustment(simulation_app: Any, duration_s: float) -> None:
+    """Keep the viewer responsive to allow manual camera adjustments before rollout."""
+    if duration_s <= 0:
+        return
+
+    deadline = time.monotonic() + duration_s
+    logging.info(
+        "Pre-inference viewer adjustment: %.1fs. Rotate/zoom/pan now; rollout starts automatically.",
+        duration_s,
+    )
+    while time.monotonic() < deadline:
+        if hasattr(simulation_app, "is_running") and not simulation_app.is_running():
+            break
+        simulation_app.update()
+        time.sleep(1.0 / 60.0)
+
+
+def main() -> None:
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+    import torch
+
+    prompt = args.prompt or DEFAULT_PROMPTS[args.scene]
+    cv2 = None
+    gui_enabled = not args.headless
+    client: SimDroidPolicyClient | None = None
+    env = None
+    simulation_app = None
+    did_cleanup = False
+    if not args.headless:
+        import cv2
+
+    def cleanup() -> None:
+        nonlocal did_cleanup
+        if did_cleanup:
+            return
+        did_cleanup = True
+
+        if cv2 is not None and gui_enabled:
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                logging.debug("Ignoring OpenCV shutdown error", exc_info=True)
+
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                logging.debug("Ignoring policy client shutdown error", exc_info=True)
+
+        if env is not None:
+            try:
+                env.close()
+            except Exception:
+                logging.warning("Failed to close gym environment cleanly", exc_info=True)
+
+        if simulation_app is not None:
+            try:
+                simulation_app.close()
+            except Exception:
+                logging.warning("Failed to close Isaac Sim app cleanly", exc_info=True)
+            # Best-effort fallback for rare cases where close() does not tear down the Kit app.
+            try:
+                kit_app_module = importlib.import_module("omni.kit.app")
+                kit_app = kit_app_module.get_app()
+                if kit_app is not None:
+                    kit_app.post_quit()
+            except Exception:
+                logging.debug("Ignoring Kit post_quit fallback failure", exc_info=True)
+
+    def _handle_termination(signum: int, _frame: Any) -> None:
+        logging.warning("Received signal %s; shutting down Isaac Sim...", signum)
+        cleanup()
+        raise KeyboardInterrupt
+
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGINT, _handle_termination)
+    signal.signal(signal.SIGTERM, _handle_termination)
+    atexit.register(cleanup)
+
+    client = SimDroidPolicyClient(
+        host="localhost",
+        port=args.port,
+        prompt=prompt,
+        open_loop_horizon=args.open_loop_horizon,
+    )
+
+    from isaaclab.app import AppLauncher
+
+    app_parser = argparse.ArgumentParser(description="DROID Isaac app launcher")
+    AppLauncher.add_app_launcher_args(app_parser)
+    args_cli, _ = app_parser.parse_known_args()
+    args_cli.enable_cameras = True
+    args_cli.headless = args.headless
+    args_cli.device = resolve_device(args_cli.device)
+    app_launcher = AppLauncher(args_cli)
+    simulation_app = app_launcher.app
+
+    import gymnasium as gym
+    import sim_evals.environments  # noqa: F401
+    from isaaclab_tasks.utils import parse_env_cfg
+
+    env_cfg = parse_env_cfg(
+        "DROID",
+        device=args_cli.device,
+        num_envs=1,
+        use_fabric=True,
+    )
+    configure_camera_resolution(env_cfg, args.cam_width, args.cam_height)
+    env_cfg.set_scene(args.scene)
+    env = gym.make("DROID", cfg=env_cfg)
+
+    obs, _ = env.reset()
+    obs, _ = env.reset()
+
+    if not args.headless:
+        wait_for_view_adjustment(simulation_app, args.pre_infer_view_seconds)
+
+    video_dir = args.video_dir
+    if video_dir is None:
+        now = datetime.now()
+        video_dir = Path("runs") / now.strftime("%Y-%m-%d") / now.strftime("%H-%M-%S")
+    if not args.no_save_video:
+        video_dir.mkdir(parents=True, exist_ok=True)
+
+    max_steps = args.max_steps or env.env.max_episode_length
+    logging.info(
+        "Starting rollouts: episodes=%d scene=%d prompt=%r max_steps=%d",
+        args.episodes,
+        args.scene,
+        prompt,
+        max_steps,
+    )
+
+    try:
+        with torch.no_grad():
+            for ep in range(args.episodes):
+                video: list[np.ndarray] = []
+                for _ in tqdm(range(max_steps), desc=f"Episode {ep + 1}/{args.episodes}"):
+                    ret = client.infer(obs)
+                    video.append(ret["viz"])
+
+                    if gui_enabled and cv2 is not None:
+                        try:
+                            cv2.imshow(
+                                "DROID cameras: external | external_2 | wrist",
+                                cv2.cvtColor(ret["viz"], cv2.COLOR_RGB2BGR),
+                            )
+                            cv2.waitKey(1)
+                        except Exception:
+                            gui_enabled = False
+                            logging.warning(
+                                "OpenCV GUI display is unavailable; disabling live preview. "
+                                "Use --headless to suppress this warning.",
+                                exc_info=True,
+                            )
+
+                    action = torch.tensor(ret["action"], dtype=torch.float32)[None]
+                    obs, _, terminated, truncated, _ = env.step(action)
+                    if terminated or truncated:
+                        break
+
+                client.reset()
+                if not args.no_save_video and video:
+                    import mediapy
+
+                    output_path = video_dir / f"episode_{ep}.mp4"
+                    mediapy.write_video(output_path, video, fps=15)
+                    logging.info("Wrote %s", output_path)
+
+                if ep + 1 < args.episodes:
+                    obs, _ = env.reset()
+                    obs, _ = env.reset()
+    finally:
+        cleanup()
+        atexit.unregister(cleanup)
+        signal.signal(signal.SIGINT, previous_sigint)
+        signal.signal(signal.SIGTERM, previous_sigterm)
+
+
+if __name__ == "__main__":
+    main()

@@ -109,9 +109,19 @@ class SceneCfg(InteractiveSceneCfg):
 
             name = child.GetName()
             print(f"Found rigid body: {name}")
-            pos = child.GetAttribute("xformOp:translate").Get()
-            rot = child.GetAttribute("xformOp:orient").Get()
-            rot = (rot.GetReal(), rot.GetImaginary()[0], rot.GetImaginary()[1], rot.GetImaginary()[2])
+            pos_attr = child.GetAttribute("xformOp:translate")
+            pos = pos_attr.Get() if pos_attr and pos_attr.IsValid() else None
+            if pos is None:
+                pos = UsdGeom.Xformable(child).ComputeLocalToWorldTransform(Usd.TimeCode.Default()).ExtractTranslation()
+
+            rot_attr = child.GetAttribute("xformOp:orient")
+            rot = rot_attr.Get() if rot_attr and rot_attr.IsValid() else None
+            if rot is None:
+                rot = (1.0, 0.0, 0.0, 0.0)
+            else:
+                rot = (rot.GetReal(), rot.GetImaginary()[0], rot.GetImaginary()[1], rot.GetImaginary()[2])
+
+            pos = (float(pos[0]), float(pos[1]), float(pos[2]))
             asset = RigidObjectCfg(
                         prim_path=f"{{ENV_REGEX_NS}}/scene/{name}",
                         spawn=None,

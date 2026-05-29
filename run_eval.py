@@ -57,6 +57,9 @@ def main(
     if backend not in {"isaac", "mujoco"}:
         raise ValueError(f"Unsupported backend: {backend}. Use 'isaac' or 'mujoco'.")
 
+    if backend == "mujoco" and scene == 4:
+        raise ValueError("Scene 4 (peg-hole) is currently supported only in Isaac backend.")
+
     import sim_evals.environments # noqa: F401
 
     if backend == "isaac":
@@ -88,6 +91,8 @@ def main(
             instruction = "put the can in the mug"
         case 3:
             instruction = "put banana in the bin"
+        case 4:
+            instruction = "pick up the blue peg and insert it into the orange hole, using small wiggle motions to align and seat it fully"
         case _:
             raise ValueError(f"Scene {scene} not supported")
         
