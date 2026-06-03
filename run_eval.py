@@ -60,7 +60,7 @@ def main(
     if backend == "mujoco" and scene == 4:
         raise ValueError("Scene 4 (peg-hole) is currently supported only in Isaac backend.")
 
-    import sim_evals.environments # noqa: F401
+    import sim_evals.environments as sim_envs
 
     if backend == "isaac":
         from isaaclab_tasks.utils import parse_env_cfg
@@ -74,6 +74,7 @@ def main(
         env_id = "DROID"
     else:
         try:
+            sim_envs.register_mujoco()
             from sim_evals.environments.mujoco_droid import MujocoDroidEnvCfg
         except ModuleNotFoundError as exc:
             raise RuntimeError(

@@ -1,11 +1,12 @@
 
 # Ensure environment registration before anything else
-import sim_evals.environments  # registers DROID_MUJOCO with Gymnasium
+import sim_evals.environments as sim_envs
 import gymnasium as gym
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+sim_envs.register_mujoco()
 
 def main():
     env = gym.make("DROID_MUJOCO")

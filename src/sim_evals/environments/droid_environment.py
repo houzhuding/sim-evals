@@ -3,9 +3,9 @@ import isaaclab.sim as sim_utils
 import isaaclab.envs.mdp as mdp
 import numpy as np
 
-from typing import List
+from typing import Any, List
 from pathlib import Path
-from pxr import Usd, UsdPhysics
+from pxr import Usd, UsdGeom, UsdPhysics
 
 from isaaclab.envs.mdp.actions.actions_cfg import BinaryJointPositionActionCfg
 from isaaclab.envs.mdp.actions.binary_joint_actions import BinaryJointPositionAction
@@ -25,6 +25,62 @@ from isaaclab.sensors import CameraCfg
 from .nvidia_droid import NVIDIA_DROID
 
 DATA_PATH = Path(__file__).parent / "../../../assets/"
+_WRIST_FT_BODY_INDEX_CACHE: dict[int, tuple[int, str]] = {}
+
+
+def _resolve_wrist_ft_body_index(robot: Any) -> tuple[int, str]:
+    cache_key = id(robot)
+    cached = _WRIST_FT_BODY_INDEX_CACHE.get(cache_key, None)
+    if cached is not None:
+        return cached
+
+    names = [str(name) for name in getattr(robot, "body_names", [])]
+    names_l = [name.lower() for name in names]
+
+    # body_incoming_joint_wrench_b is indexed by child body. Prefer the gripper
+    # base so the reported wrench corresponds to the fixed wrist/gripper joint.
+    preferred_token_sets = (
+        ("robotiq", "base"),
+        ("gripper", "base"),
+        ("base_link",),
+        ("panda_hand",),
+        ("panda_link8",),
+        ("hand",),
+        ("wrist",),
+    )
+    for tokens in preferred_token_sets:
+        for index, name in enumerate(names_l):
+            if all(token in name for token in tokens):
+                out = (int(index), names[index])
+                _WRIST_FT_BODY_INDEX_CACHE[cache_key] = out
+                return out
+
+    fallback = (len(names) - 1, names[-1]) if names else (-1, "")
+    _WRIST_FT_BODY_INDEX_CACHE[cache_key] = fallback
+    return fallback
+
+
+def wrist_wrench_local(
+    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+):
+    robot = env.scene[asset_cfg.name]
+    body_index, body_name = _resolve_wrist_ft_body_index(robot)
+    if body_index < 0:
+        return torch.zeros(6, device=robot.device, dtype=torch.float32)
+
+    wrench = getattr(robot.data, "body_incoming_joint_wrench_b", None)
+    if wrench is None:
+        return torch.zeros(6, device=robot.device, dtype=torch.float32)
+
+    if not getattr(wrist_wrench_local, "_source_printed", False):
+        print(
+            "[DROID] wrist wrench source: "
+            f"body_incoming_joint_wrench_b body='{body_name}' index={body_index}",
+            flush=True,
+        )
+        wrist_wrench_local._source_printed = True
+
+    return wrench[0, body_index, :6].to(dtype=torch.float32)
 
 @configclass
 class SceneCfg(InteractiveSceneCfg):
@@ -86,8 +142,13 @@ class SceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    def dynamic_scene(self, scene_name: str):
-        environment_path = DATA_PATH / f"scene{scene_name}.usd"
+    def dynamic_scene(self, scene_name: str, scene_path: str | Path | None = None):
+        if scene_path is not None:
+            environment_path = Path(scene_path)
+        else:
+            environment_path = DATA_PATH / f"scene{scene_name}.usd"
+        if not environment_path.exists() and str(scene_name) == "5":
+            environment_path = DATA_PATH / "scene4.usd"
         scene = AssetBaseCfg(
                 prim_path="{ENV_REGEX_NS}/scene",
                 spawn = sim_utils.UsdFileCfg(
@@ -229,6 +290,7 @@ class ObservationCfg:
         gripper_pos = ObsTerm(
             func=gripper_pos, noise=noise.GaussianNoiseCfg(std=0.05), clip=(0, 1)
         )
+        wrist_wrench = ObsTerm(func=wrist_wrench_local)
         external_cam = ObsTerm(
                 func=mdp.observations.image,
                 params={
@@ -315,7 +377,5 @@ class EnvCfg(ManagerBasedRLEnvCfg):
         self.rerender_on_reset = True
 
     
-    def set_scene(self, scene_name: str):
-        self.scene.dynamic_scene(scene_name)
-
-
+    def set_scene(self, scene_name: str, scene_path: str | Path | None = None):
+        self.scene.dynamic_scene(scene_name, scene_path=scene_path)

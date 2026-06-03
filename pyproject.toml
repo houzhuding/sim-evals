@@ -10,14 +10,22 @@ dependencies = [
   "openpi-client",
   "isaaclab[all,isaacsim]==2.2.0",
   "mujoco>=3.2.0",
+  "pin==2.7.0",
+  "pyarrow>=24.0.0",
   "tyro>=0.9.17",
   "websockets>=16.0",
+  "ant-franka-control",
+  "gello",
+  "dynamixel-sdk>=3.7.31",
 ]
 
 [tool.uv]
 override-dependencies = [
   "websockets>=16.0"
 ]
+
+[tool.uv.extra-build-dependencies]
+flatdict = ["setuptools<81"]
 
 [tool.uv.sources]
 torch = [
@@ -27,6 +35,8 @@ torchvision = {index = "pytorch-cu118", marker = "sys_platform == 'linux' or sys
 isaacsim = { index = "isaac" }
 real2simeval = { workspace = true }
 openpi-client = { git = "https://github.com/Physical-Intelligence/openpi.git", subdirectory = "packages/openpi-client" }
+ant-franka-control = { path = "../..", editable = true }
+gello = { path = "../gello_software", editable = true }
 
 [[tool.uv.index]]
 name = "isaac"

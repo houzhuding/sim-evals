@@ -18,11 +18,12 @@ parser.add_argument("--steps", type=int, default=0, help="Number of random actio
 parser.add_argument("--viewer", action="store_true", help="Launch interactive MuJoCo viewer")
 args = parser.parse_args()
 
-import sim_evals.environments  # registers DROID_MUJOCO
+import sim_evals.environments as sim_envs
 import gymnasium as gym
 import numpy as np
 import cv2
 
+sim_envs.register_mujoco()
 env = gym.make("DROID_MUJOCO")
 env.unwrapped.cfg.scene = args.scene
 obs, _ = env.reset()

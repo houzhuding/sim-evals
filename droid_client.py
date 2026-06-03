@@ -12,7 +12,10 @@ import argparse
 import atexit
 import importlib
 import logging
+import math
+import shutil
 import signal
+import tempfile
 import time
 import uuid
 from datetime import datetime
@@ -31,8 +34,12 @@ DEFAULT_PROMPTS = {
     2: "put the can in the mug",
     3: "put banana in the bin",
     4: "pick up the blue peg and insert it into the orange hole, using small wiggle motions to align and seat it fully",
+    5: "insert the blue block in the orange block-shaped hole",
 }
 RELATIVE_FRAME_OFFSETS = [-23, -16, -8, 0]
+SCENE5_DEFAULT_HOLE_SIZE_M = 0.04
+SCENE5_WALL_THICKNESS_M = 0.0075
+SCENE5_BOTTOM_THICKNESS_M = 0.01
 
 
 class SimDroidPolicyClient:
@@ -305,6 +312,80 @@ def configure_camera_resolution(env_cfg: Any, width: int, height: int) -> None:
         cam_cfg.height = height
 
 
+def resolve_hole_size_m(args: argparse.Namespace) -> float | None:
+    if args.hole_size is not None and args.hole_size_mm is not None:
+        raise ValueError("Use only one of --hole-size or --hole-size-mm.")
+
+    if args.hole_size_mm is not None:
+        hole_size_m = float(args.hole_size_mm) / 1000.0
+    elif args.hole_size is not None:
+        raw_size = float(args.hole_size)
+        # The scene is authored in meters, but this task is usually described in mm.
+        hole_size_m = raw_size / 1000.0 if raw_size > 1.0 else raw_size
+    else:
+        return None
+
+    if not math.isfinite(hole_size_m) or hole_size_m <= 0:
+        raise ValueError(f"Hole size must be positive, got {hole_size_m!r} m")
+    if hole_size_m < 0.005 or hole_size_m > 0.20:
+        raise ValueError(
+            f"Hole size {hole_size_m:.4f} m is outside the expected range "
+            "0.005-0.20 m."
+        )
+    return hole_size_m
+
+
+def create_scene5_with_hole_size(hole_size_m: float) -> Path:
+    """Create a temporary scene-5 USD with a square hole opening of A x A x A."""
+    from pxr import Gf, Usd
+
+    assets_dir = Path(__file__).resolve().parent / "assets"
+    source_path = assets_dir / "scene5.usd"
+    if not source_path.exists():
+        source_path = assets_dir / "scene4.usd"
+    if not source_path.exists():
+        raise FileNotFoundError(f"Missing source scene USD: {source_path}")
+
+    hole_size_mm = int(round(hole_size_m * 1000.0))
+    output_path = Path(tempfile.gettempdir()) / f"sim_evals_scene5_hole_{hole_size_mm}mm.usd"
+    shutil.copy2(source_path, output_path)
+
+    stage = Usd.Stage.Open(str(output_path))
+    if stage is None:
+        raise RuntimeError(f"Failed to open generated scene: {output_path}")
+
+    wall_t = SCENE5_WALL_THICKNESS_M
+    bottom_t = SCENE5_BOTTOM_THICKNESS_M
+    outer_size = hole_size_m + 2.0 * wall_t
+    wall_center = hole_size_m / 2.0 + wall_t / 2.0
+    wall_z = bottom_t + hole_size_m / 2.0
+
+    def set_vec3(path: str, attr_name: str, value: tuple[float, float, float], vec_type: Any) -> None:
+        prim = stage.GetPrimAtPath(path)
+        if not prim or not prim.IsValid():
+            raise RuntimeError(f"Missing prim in scene5 USD: {path}")
+        attr = prim.GetAttribute(attr_name)
+        if not attr or not attr.IsValid():
+            raise RuntimeError(f"Missing attribute {attr_name!r} on {path}")
+        attr.Set(vec_type(*value))
+
+    set_vec3("/World/hole/bottom", "xformOp:scale", (outer_size, outer_size, bottom_t), Gf.Vec3f)
+    set_vec3("/World/hole/bottom", "xformOp:translate", (0.0, 0.0, bottom_t / 2.0), Gf.Vec3d)
+
+    set_vec3("/World/hole/wall_pos_x", "xformOp:scale", (wall_t, outer_size, hole_size_m), Gf.Vec3f)
+    set_vec3("/World/hole/wall_pos_x", "xformOp:translate", (wall_center, 0.0, wall_z), Gf.Vec3d)
+    set_vec3("/World/hole/wall_neg_x", "xformOp:scale", (wall_t, outer_size, hole_size_m), Gf.Vec3f)
+    set_vec3("/World/hole/wall_neg_x", "xformOp:translate", (-wall_center, 0.0, wall_z), Gf.Vec3d)
+
+    set_vec3("/World/hole/wall_pos_y", "xformOp:scale", (hole_size_m, wall_t, hole_size_m), Gf.Vec3f)
+    set_vec3("/World/hole/wall_pos_y", "xformOp:translate", (0.0, wall_center, wall_z), Gf.Vec3d)
+    set_vec3("/World/hole/wall_neg_y", "xformOp:scale", (hole_size_m, wall_t, hole_size_m), Gf.Vec3f)
+    set_vec3("/World/hole/wall_neg_y", "xformOp:translate", (0.0, -wall_center, wall_z), Gf.Vec3d)
+
+    stage.Save()
+    return output_path
+
+
 def resolve_device(requested_device: str) -> str:
     if not requested_device.startswith("cuda"):
         return requested_device
@@ -339,7 +420,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--port", type=int, default=50532, help="Policy server port")
     parser.add_argument("--episodes", type=int, default=1, help="Number of rollouts")
-    parser.add_argument("--scene", type=int, default=1, choices=[1, 2, 3, 4])
+    parser.add_argument("--scene", type=int, default=1, choices=[1, 2, 3, 4, 5])
+    parser.add_argument(
+        "--hole-size",
+        type=float,
+        default=None,
+        help=(
+            "Scene-5 square hole size A. Values <= 1 are meters, values > 1 "
+            "are interpreted as millimeters. Example: 0.06 or 60 for a 60 mm hole."
+        ),
+    )
+    parser.add_argument(
+        "--hole-size-mm",
+        type=float,
+        default=None,
+        help="Scene-5 square hole size A in millimeters.",
+    )
     parser.add_argument("--headless", action="store_true", help="Run without GUI")
     parser.add_argument(
         "--prompt",
@@ -416,6 +512,15 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     import torch
+
+    hole_size_m = resolve_hole_size_m(args)
+    if hole_size_m is not None and args.scene != 5:
+        logging.warning(
+            "--hole-size was provided with --scene %d; using scene 5, the scene-4 copy "
+            "with a resizable hole.",
+            args.scene,
+        )
+        args.scene = 5
 
     prompt = args.prompt or DEFAULT_PROMPTS[args.scene]
     cv2 = None
@@ -505,7 +610,20 @@ def main() -> None:
         use_fabric=True,
     )
     configure_camera_resolution(env_cfg, args.cam_width, args.cam_height)
-    env_cfg.set_scene(args.scene)
+    scene_path = None
+    if args.scene == 5 and hole_size_m is not None:
+        scene_path = create_scene5_with_hole_size(hole_size_m)
+        logging.info(
+            "Using generated scene 5 with hole size %.1f mm: %s",
+            hole_size_m * 1000.0,
+            scene_path,
+        )
+    elif args.scene == 5:
+        logging.info(
+            "Using scene 5 default hole size %.1f mm. Pass --hole-size to resize it.",
+            SCENE5_DEFAULT_HOLE_SIZE_M * 1000.0,
+        )
+    env_cfg.set_scene(args.scene, scene_path=scene_path)
     env = gym.make("DROID", cfg=env_cfg)
 
     obs, _ = env.reset()
@@ -523,9 +641,10 @@ def main() -> None:
 
     max_steps = args.max_steps or env.env.max_episode_length
     logging.info(
-        "Starting rollouts: episodes=%d scene=%d prompt=%r max_steps=%d",
+        "Starting rollouts: episodes=%d scene=%d hole_size_mm=%s prompt=%r max_steps=%d",
         args.episodes,
         args.scene,
+        None if hole_size_m is None else round(hole_size_m * 1000.0, 3),
         prompt,
         max_steps,
     )
