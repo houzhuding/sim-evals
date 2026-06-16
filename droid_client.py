@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import csv
 import importlib
 import logging
 import math
@@ -51,6 +52,7 @@ class SimDroidPolicyClient:
         port: int,
         prompt: str,
         open_loop_horizon: int = 24,
+        trace_dir: Path | None = None,
     ) -> None:
         self.client = RoboarenaWebsocketClient(host=host, port=port)
         self.prompt = prompt
@@ -59,6 +61,19 @@ class SimDroidPolicyClient:
         self.pred_action_chunk: np.ndarray | None = None
         self.actions_from_chunk_completed = 0
         self.obs_history: list[dict[str, Any]] = []
+        self.chunk_index = -1
+        self.last_chunk_infer_time_s = math.nan
+        self.trace_dir = trace_dir
+        self._trace_file = None
+        self._trace_writer: csv.DictWriter | None = None
+        if self.trace_dir is not None:
+            self.trace_dir.mkdir(parents=True, exist_ok=True)
+            self._trace_file = open(self.trace_dir / "execution_trace.csv", "w", newline="")
+            self._trace_writer = csv.DictWriter(
+                self._trace_file,
+                fieldnames=execution_trace_fieldnames(),
+            )
+            self._trace_writer.writeheader()
 
         metadata = self.client.get_server_metadata()
         logging.info("Server metadata: %s", metadata)
@@ -83,14 +98,21 @@ class SimDroidPolicyClient:
         self.pred_action_chunk = None
         self.obs_history = []
         self.session_id = str(uuid.uuid4())
+        self.chunk_index = -1
+        self.last_chunk_infer_time_s = math.nan
         self.client.reset()
 
     def close(self) -> None:
+        if self._trace_file is not None:
+            self._trace_file.flush()
+            self._trace_file.close()
+            self._trace_file = None
         self.client.close()
 
-    def infer(self, sim_obs: dict[str, Any]) -> dict[str, np.ndarray]:
+    def infer(self, sim_obs: dict[str, Any]) -> dict[str, Any]:
         """Return one action for the current simulation observation."""
-        self.obs_history.append(extract_server_fields(sim_obs))
+        pre_server_obs = extract_server_fields(sim_obs)
+        self.obs_history.append(pre_server_obs)
         history_limit = max(abs(min(RELATIVE_FRAME_OFFSETS)) + 1, self.open_loop_horizon + 1)
         if len(self.obs_history) > history_limit:
             self.obs_history = self.obs_history[-history_limit:]
@@ -109,6 +131,8 @@ class SimDroidPolicyClient:
             dt = time.time() - t0
             self.pred_action_chunk = extract_action_chunk(response)
             self.actions_from_chunk_completed = 0
+            self.chunk_index += 1
+            self.last_chunk_infer_time_s = dt
             logging.info(
                 "Received action chunk %s in %.2fs, range [%.4f, %.4f]",
                 self.pred_action_chunk.shape,
@@ -117,13 +141,59 @@ class SimDroidPolicyClient:
                 float(self.pred_action_chunk.max()),
             )
 
-        action = self.pred_action_chunk[self.actions_from_chunk_completed].astype(
-            np.float32
-        )
+        horizon_index = self.actions_from_chunk_completed
+        raw_action = self.pred_action_chunk[horizon_index].astype(np.float32)
+        action = raw_action.copy()
         self.actions_from_chunk_completed += 1
 
         action[-1] = 1.0 if action[-1] > 0.5 else 0.0
-        return {"action": action, "viz": make_viz_image(sim_obs)}
+        return {
+            "action": action,
+            "viz": make_viz_image(sim_obs),
+            "trace": {
+                "session_id": self.session_id,
+                "chunk_index": self.chunk_index,
+                "horizon_index": horizon_index,
+                "chunk_infer_time_s": self.last_chunk_infer_time_s,
+                "pre_obs": pre_server_obs,
+                "raw_action": raw_action,
+                "executed_action": action,
+            },
+        }
+
+    def record_execution(
+        self,
+        *,
+        episode: int,
+        env_step: int,
+        trace: dict[str, Any],
+        post_obs: dict[str, Any],
+        step_wall_time_s: float,
+    ) -> None:
+        if self._trace_writer is None:
+            return
+        row = {
+            "wall_time_s": time.time(),
+            "episode": episode,
+            "env_step": env_step,
+            "session_id": trace["session_id"],
+            "chunk_index": trace["chunk_index"],
+            "horizon_index": trace["horizon_index"],
+            "chunk_infer_time_s": trace["chunk_infer_time_s"],
+            "step_wall_time_s": step_wall_time_s,
+        }
+        add_vector_fields(row, "pre_joint_q", trace["pre_obs"].get("observation/joint_position"), 7)
+        add_vector_fields(row, "pre_gripper", trace["pre_obs"].get("observation/gripper_position"), 1)
+        add_vector_fields(row, "pre_wrench", trace["pre_obs"].get("observation/wrist_wrench"), 6)
+        add_vector_fields(row, "raw_action", trace["raw_action"], 8)
+        add_vector_fields(row, "executed_action", trace["executed_action"], 8)
+        post_server_obs = extract_server_fields(post_obs)
+        add_vector_fields(row, "post_joint_q", post_server_obs.get("observation/joint_position"), 7)
+        add_vector_fields(row, "post_gripper", post_server_obs.get("observation/gripper_position"), 1)
+        add_vector_fields(row, "post_wrench", post_server_obs.get("observation/wrist_wrench"), 6)
+        self._trace_writer.writerow(row)
+        if self._trace_file is not None:
+            self._trace_file.flush()
 
     def _select_request_frames(self) -> list[dict[str, Any]]:
         if self.pred_action_chunk is None:
@@ -211,6 +281,50 @@ def tensor_state_to_numpy(value: Any) -> np.ndarray:
     return np.asarray(value, dtype=np.float32)
 
 
+def vector_or_none(value: Any, width: int) -> np.ndarray | None:
+    if value is None:
+        return None
+    array = tensor_state_to_numpy(value).reshape(-1)
+    if array.size < width:
+        padded = np.full(width, np.nan, dtype=np.float32)
+        padded[: array.size] = array
+        return padded
+    return array[:width].astype(np.float32)
+
+
+def add_vector_fields(row: dict[str, Any], prefix: str, value: Any, width: int) -> None:
+    vector = vector_or_none(value, width)
+    if vector is None:
+        vector = np.full(width, np.nan, dtype=np.float32)
+    for index in range(width):
+        row[f"{prefix}_{index}"] = float(vector[index])
+
+
+def execution_trace_fieldnames() -> list[str]:
+    fields = [
+        "wall_time_s",
+        "episode",
+        "env_step",
+        "session_id",
+        "chunk_index",
+        "horizon_index",
+        "chunk_infer_time_s",
+        "step_wall_time_s",
+    ]
+    for prefix, width in (
+        ("pre_joint_q", 7),
+        ("pre_gripper", 1),
+        ("pre_wrench", 6),
+        ("raw_action", 8),
+        ("executed_action", 8),
+        ("post_joint_q", 7),
+        ("post_gripper", 1),
+        ("post_wrench", 6),
+    ):
+        fields.extend(f"{prefix}_{index}" for index in range(width))
+    return fields
+
+
 def is_torch_tensor(value: Any) -> bool:
     try:
         import torch
@@ -221,7 +335,7 @@ def is_torch_tensor(value: Any) -> bool:
 
 def extract_server_fields(sim_obs: dict[str, Any]) -> dict[str, Any]:
     policy_obs = sim_obs["policy"]
-    return {
+    fields = {
         "observation/exterior_image_0_left": tensor_image_to_numpy(
             policy_obs["external_cam"]
         ),
@@ -237,6 +351,18 @@ def extract_server_fields(sim_obs: dict[str, Any]) -> dict[str, Any]:
             policy_obs["gripper_pos"]
         ),
     }
+    for wrench_key in (
+        "wrist_wrench",
+        "wrist_force_torque",
+        "wrist_ft",
+        "force_torque",
+    ):
+        if wrench_key in policy_obs:
+            wrench = vector_or_none(policy_obs[wrench_key], 6)
+            if wrench is not None:
+                fields["observation/wrist_wrench"] = wrench
+            break
+    return fields
 
 
 def make_server_observation(
@@ -253,6 +379,8 @@ def make_server_observation(
         "prompt": prompt,
         "session_id": session_id,
     }
+    if "observation/wrist_wrench" in current_obs:
+        request["observation/wrist_wrench"] = current_obs["observation/wrist_wrench"]
 
     for image_key in (
         "observation/exterior_image_0_left",
@@ -473,6 +601,12 @@ def parse_args() -> argparse.Namespace:
         help="Directory for rollout videos. Defaults to runs/<date>/<time>.",
     )
     parser.add_argument(
+        "--trace-dir",
+        type=Path,
+        default=None,
+        help="Directory for execution_trace.csv. Defaults to <video-dir>/trace.",
+    )
+    parser.add_argument(
         "--no-save-video",
         action="store_true",
         help="Disable writing rollout videos.",
@@ -581,12 +715,20 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _handle_termination)
     atexit.register(cleanup)
 
+    video_dir = args.video_dir
+    if video_dir is None:
+        now = datetime.now()
+        video_dir = Path("runs") / now.strftime("%Y-%m-%d") / now.strftime("%H-%M-%S")
+    trace_dir = args.trace_dir or (video_dir / "trace")
+
     client = SimDroidPolicyClient(
         host="localhost",
         port=args.port,
         prompt=prompt,
         open_loop_horizon=args.open_loop_horizon,
+        trace_dir=trace_dir,
     )
+    logging.info("Execution trace CSV: %s", trace_dir / "execution_trace.csv")
 
     from isaaclab.app import AppLauncher
 
@@ -632,10 +774,6 @@ def main() -> None:
     if not args.headless:
         wait_for_view_adjustment(simulation_app, args.pre_infer_view_seconds)
 
-    video_dir = args.video_dir
-    if video_dir is None:
-        now = datetime.now()
-        video_dir = Path("runs") / now.strftime("%Y-%m-%d") / now.strftime("%H-%M-%S")
     if not args.no_save_video:
         video_dir.mkdir(parents=True, exist_ok=True)
 
@@ -653,7 +791,7 @@ def main() -> None:
         with torch.no_grad():
             for ep in range(args.episodes):
                 video: list[np.ndarray] = []
-                for _ in tqdm(range(max_steps), desc=f"Episode {ep + 1}/{args.episodes}"):
+                for env_step in tqdm(range(max_steps), desc=f"Episode {ep + 1}/{args.episodes}"):
                     ret = client.infer(obs)
                     video.append(ret["viz"])
 
@@ -673,7 +811,16 @@ def main() -> None:
                             )
 
                     action = torch.tensor(ret["action"], dtype=torch.float32)[None]
+                    step_t0 = time.time()
                     obs, _, terminated, truncated, _ = env.step(action)
+                    step_dt = time.time() - step_t0
+                    client.record_execution(
+                        episode=ep,
+                        env_step=env_step,
+                        trace=ret["trace"],
+                        post_obs=obs,
+                        step_wall_time_s=step_dt,
+                    )
                     if terminated or truncated:
                         break
 
