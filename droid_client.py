@@ -53,10 +53,15 @@ class SimDroidPolicyClient:
         prompt: str,
         open_loop_horizon: int = 24,
         trace_dir: Path | None = None,
+        lock_gripper_close: bool = False,
+        latch_gripper_after_close: bool = False,
     ) -> None:
         self.client = RoboarenaWebsocketClient(host=host, port=port)
         self.prompt = prompt
         self.open_loop_horizon = int(open_loop_horizon)
+        self.lock_gripper_close = bool(lock_gripper_close)
+        self.latch_gripper_after_close = bool(latch_gripper_after_close)
+        self.gripper_latched_closed = False
         self.session_id = str(uuid.uuid4())
         self.pred_action_chunk: np.ndarray | None = None
         self.actions_from_chunk_completed = 0
@@ -100,6 +105,7 @@ class SimDroidPolicyClient:
         self.session_id = str(uuid.uuid4())
         self.chunk_index = -1
         self.last_chunk_infer_time_s = math.nan
+        self.gripper_latched_closed = False
         self.client.reset()
 
     def close(self) -> None:
@@ -146,7 +152,16 @@ class SimDroidPolicyClient:
         action = raw_action.copy()
         self.actions_from_chunk_completed += 1
 
-        action[-1] = 1.0 if action[-1] > 0.5 else 0.0
+        model_gripper_close = bool(action[-1] > 0.5)
+        if self.lock_gripper_close:
+            action[-1] = 1.0
+            self.gripper_latched_closed = True
+        elif self.latch_gripper_after_close:
+            if model_gripper_close:
+                self.gripper_latched_closed = True
+            action[-1] = 1.0 if self.gripper_latched_closed else 0.0
+        else:
+            action[-1] = 1.0 if model_gripper_close else 0.0
         return {
             "action": action,
             "viz": make_viz_image(sim_obs),
@@ -155,6 +170,9 @@ class SimDroidPolicyClient:
                 "chunk_index": self.chunk_index,
                 "horizon_index": horizon_index,
                 "chunk_infer_time_s": self.last_chunk_infer_time_s,
+                "lock_gripper_close": self.lock_gripper_close,
+                "latch_gripper_after_close": self.latch_gripper_after_close,
+                "gripper_latched_closed": self.gripper_latched_closed,
                 "pre_obs": pre_server_obs,
                 "raw_action": raw_action,
                 "executed_action": action,
@@ -181,6 +199,9 @@ class SimDroidPolicyClient:
             "horizon_index": trace["horizon_index"],
             "chunk_infer_time_s": trace["chunk_infer_time_s"],
             "step_wall_time_s": step_wall_time_s,
+            "lock_gripper_close": bool(trace.get("lock_gripper_close", False)),
+            "latch_gripper_after_close": bool(trace.get("latch_gripper_after_close", False)),
+            "gripper_latched_closed": bool(trace.get("gripper_latched_closed", False)),
         }
         add_vector_fields(row, "pre_joint_q", trace["pre_obs"].get("observation/joint_position"), 7)
         add_vector_fields(row, "pre_gripper", trace["pre_obs"].get("observation/gripper_position"), 1)
@@ -310,6 +331,9 @@ def execution_trace_fieldnames() -> list[str]:
         "horizon_index",
         "chunk_infer_time_s",
         "step_wall_time_s",
+        "lock_gripper_close",
+        "latch_gripper_after_close",
+        "gripper_latched_closed",
     ]
     for prefix, width in (
         ("pre_joint_q", 7),
@@ -607,6 +631,16 @@ def parse_args() -> argparse.Namespace:
         help="Directory for execution_trace.csv. Defaults to <video-dir>/trace.",
     )
     parser.add_argument(
+        "--lock-gripper-close",
+        action="store_true",
+        help="Force the executed gripper action to close while preserving raw model output in logs.",
+    )
+    parser.add_argument(
+        "--latch-gripper-after-close",
+        action="store_true",
+        help="Use model gripper output until first close command, then keep the gripper closed.",
+    )
+    parser.add_argument(
         "--no-save-video",
         action="store_true",
         help="Disable writing rollout videos.",
@@ -727,8 +761,14 @@ def main() -> None:
         prompt=prompt,
         open_loop_horizon=args.open_loop_horizon,
         trace_dir=trace_dir,
+        lock_gripper_close=args.lock_gripper_close,
+        latch_gripper_after_close=args.latch_gripper_after_close,
     )
     logging.info("Execution trace CSV: %s", trace_dir / "execution_trace.csv")
+    if args.lock_gripper_close:
+        logging.info("Gripper override enabled: executed action[-1] is forced to 1.0 (close)")
+    elif args.latch_gripper_after_close:
+        logging.info("Gripper latch enabled: model controls gripper until first close, then close is held")
 
     from isaaclab.app import AppLauncher
 
