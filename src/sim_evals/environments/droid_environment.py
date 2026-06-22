@@ -82,6 +82,49 @@ def wrist_wrench_local(
 
     return wrench[0, body_index, :6].to(dtype=torch.float32)
 
+
+def _quat_wxyz_to_rot6d(quat_wxyz: torch.Tensor) -> torch.Tensor:
+    quat = quat_wxyz.to(dtype=torch.float32)
+    quat = quat / torch.clamp(torch.linalg.norm(quat, dim=-1, keepdim=True), min=1e-8)
+    w, x, y, z = quat.unbind(dim=-1)
+
+    r00 = 1.0 - 2.0 * (y * y + z * z)
+    r01 = 2.0 * (x * y - z * w)
+    r10 = 2.0 * (x * y + z * w)
+    r11 = 1.0 - 2.0 * (x * x + z * z)
+    r20 = 2.0 * (x * z - y * w)
+    r21 = 2.0 * (y * z + x * w)
+    return torch.stack([r00, r10, r20, r01, r11, r21], dim=-1)
+
+
+def ee_pose9d_rot6d(
+    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+):
+    robot = env.scene[asset_cfg.name]
+    body_index, body_name = _resolve_wrist_ft_body_index(robot)
+    if body_index < 0:
+        return torch.zeros(9, device=robot.device, dtype=torch.float32)
+
+    if hasattr(robot.data, "body_pos_w") and hasattr(robot.data, "body_quat_w"):
+        pos = robot.data.body_pos_w[0, body_index]
+        quat_wxyz = robot.data.body_quat_w[0, body_index]
+    else:
+        body_state = getattr(robot.data, "body_state_w", None)
+        if body_state is None:
+            return torch.zeros(9, device=robot.device, dtype=torch.float32)
+        pos = body_state[0, body_index, :3]
+        quat_wxyz = body_state[0, body_index, 3:7]
+
+    if not getattr(ee_pose9d_rot6d, "_source_printed", False):
+        print(
+            "[DROID] ee_pose9d_rot6d source: "
+            f"body='{body_name}' index={body_index}",
+            flush=True,
+        )
+        ee_pose9d_rot6d._source_printed = True
+
+    return torch.cat([pos.to(dtype=torch.float32), _quat_wxyz_to_rot6d(quat_wxyz)], dim=-1)
+
 @configclass
 class SceneCfg(InteractiveSceneCfg):
     """Configuration for a cart-pole scene."""
@@ -287,6 +330,7 @@ class ObservationCfg:
         """Observations for policy."""
 
         arm_joint_pos = ObsTerm(func=arm_joint_pos)
+        ee_pose9d_rot6d = ObsTerm(func=ee_pose9d_rot6d)
         gripper_pos = ObsTerm(
             func=gripper_pos, noise=noise.GaussianNoiseCfg(std=0.05), clip=(0, 1)
         )
