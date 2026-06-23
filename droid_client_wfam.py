@@ -24,6 +24,7 @@ import argparse
 import atexit
 import csv
 import importlib
+import json
 import logging
 import math
 import signal
@@ -82,6 +83,53 @@ def make_transform(position: np.ndarray, rotation: np.ndarray) -> np.ndarray:
     transform[:3, :3] = rotation
     transform[:3, 3] = position
     return transform
+
+
+def pose9d_rot6d_to_transform(pose9d: Any) -> np.ndarray:
+    position, rotation = pose9d_rot6d_to_matrix(pose9d)
+    return make_transform(position, rotation)
+
+
+def matrix_to_rpy_zyx(rotation: np.ndarray) -> np.ndarray:
+    """Return roll, pitch, yaw for R = Rz(yaw) Ry(pitch) Rx(roll)."""
+    rotation = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
+    sy = math.sqrt(rotation[0, 0] ** 2 + rotation[1, 0] ** 2)
+    singular = sy < 1e-8
+    if not singular:
+        roll = math.atan2(rotation[2, 1], rotation[2, 2])
+        pitch = math.atan2(-rotation[2, 0], sy)
+        yaw = math.atan2(rotation[1, 0], rotation[0, 0])
+    else:
+        roll = math.atan2(-rotation[1, 2], rotation[1, 1])
+        pitch = math.atan2(-rotation[2, 0], sy)
+        yaw = 0.0
+    return np.asarray([roll, pitch, yaw], dtype=np.float64)
+
+
+def vector_to_json(value: Any, digits: int = 6) -> list[float]:
+    array = np.asarray(value, dtype=np.float64).reshape(-1)
+    return [round(float(item), digits) for item in array]
+
+
+def matrix_to_json(value: Any, digits: int = 6) -> list[list[float]]:
+    array = np.asarray(value, dtype=np.float64)
+    return [
+        [round(float(item), digits) for item in row]
+        for row in array.tolist()
+    ]
+
+
+def format_vector(value: Any, digits: int = 2) -> str:
+    array = np.asarray(value, dtype=np.float64).reshape(-1)
+    return "[" + ", ".join(f"{item:.{digits}f}" for item in array) + "]"
+
+
+def format_matrix4(value: Any, digits: int = 4) -> str:
+    array = np.asarray(value, dtype=np.float64).reshape(4, 4)
+    return "\n".join(
+        "  [" + ", ".join(f"{item:.{digits}f}" for item in row) + "]"
+        for row in array
+    )
 
 
 def matrix_to_rotvec(rotation: np.ndarray) -> np.ndarray:
@@ -263,6 +311,9 @@ class SimDroidWFAMPolicyClient:
         execution_mode: str = "ik-joint",
         allow_missing_ee_pose: bool = False,
         ik_solver: FrankaPose9DIKSolver | None = None,
+        dump_action_chunks: bool = False,
+        print_action_chunk_matrices: bool = False,
+        action_chunk_dump_dir: Path | None = None,
     ) -> None:
         if execution_mode not in {"ik-joint", "hold-joint", "pose9d-direct"}:
             raise ValueError(f"Unsupported execution_mode: {execution_mode}")
@@ -274,6 +325,8 @@ class SimDroidWFAMPolicyClient:
         self.execution_mode = execution_mode
         self.allow_missing_ee_pose = bool(allow_missing_ee_pose)
         self.ik_solver = ik_solver or FrankaPose9DIKSolver()
+        self.dump_action_chunks = bool(dump_action_chunks)
+        self.print_action_chunk_matrices = bool(print_action_chunk_matrices)
         self.gripper_latched_closed = False
         self.session_id = str(uuid.uuid4())
         self.pred_action_chunk: np.ndarray | None = None
@@ -292,6 +345,12 @@ class SimDroidWFAMPolicyClient:
                 fieldnames=execution_trace_fieldnames(),
             )
             self._trace_writer.writeheader()
+        if action_chunk_dump_dir is not None:
+            self.action_chunk_dump_dir = action_chunk_dump_dir
+        elif self.trace_dir is not None:
+            self.action_chunk_dump_dir = self.trace_dir / "action_chunks"
+        else:
+            self.action_chunk_dump_dir = None
 
         metadata = self.client.get_server_metadata()
         logging.info("Server metadata: %s", metadata)
@@ -360,6 +419,7 @@ class SimDroidWFAMPolicyClient:
                 float(self.pred_action_chunk.min()),
                 float(self.pred_action_chunk.max()),
             )
+            self._dump_action_chunk_debug(pre_server_obs)
 
         horizon_index = self.actions_from_chunk_completed
         raw_action = self.pred_action_chunk[horizon_index].astype(np.float32)
@@ -491,6 +551,138 @@ class SimDroidWFAMPolicyClient:
             self.obs_history[max(anchor + offset, 0)]
             for offset in RELATIVE_FRAME_OFFSETS
         ]
+
+    def _dump_action_chunk_debug(self, pre_server_obs: dict[str, Any]) -> None:
+        if self.pred_action_chunk is None:
+            return
+        if not (self.dump_action_chunks or self.print_action_chunk_matrices):
+            return
+
+        current_pose9d = pre_server_obs["observation/ee_pose9d_rot6d"]
+        current_transform = pose9d_rot6d_to_transform(current_pose9d)
+        current_inverse = np.linalg.inv(current_transform)
+        current_joint_q = droid_base.vector_or_none(
+            pre_server_obs.get("observation/joint_position"),
+            7,
+        )
+        if current_joint_q is None:
+            current_joint_q = np.zeros(7, dtype=np.float32)
+        current_joint_q = np.asarray(current_joint_q, dtype=np.float64)
+        current_joint_deg = np.rad2deg(current_joint_q)
+        current_xyz_mm = current_transform[:3, 3] * 1000.0
+        current_rpy_deg = np.rad2deg(matrix_to_rpy_zyx(current_transform[:3, :3]))
+
+        logging.info(
+            "WFAM chunk %04d debug: current_xyz_mm=%s current_rpy_deg=%s current_joint_deg=%s",
+            self.chunk_index,
+            format_vector(current_xyz_mm),
+            format_vector(current_rpy_deg),
+            format_vector(current_joint_deg),
+        )
+
+        rows = []
+        for horizon_index, raw_action in enumerate(self.pred_action_chunk):
+            target_pose9d = raw_action[:9]
+            target_transform = pose9d_rot6d_to_transform(target_pose9d)
+            delta_transform = current_inverse @ target_transform
+            target_xyz_mm = target_transform[:3, 3] * 1000.0
+            target_rpy_deg = np.rad2deg(matrix_to_rpy_zyx(target_transform[:3, :3]))
+            delta_xyz_world_mm = (target_transform[:3, 3] - current_transform[:3, 3]) * 1000.0
+            delta_xyz_local_mm = delta_transform[:3, 3] * 1000.0
+            delta_rpy_deg = np.rad2deg(matrix_to_rpy_zyx(delta_transform[:3, :3]))
+            target_delta_m = float(np.linalg.norm(target_transform[:3, 3] - current_transform[:3, 3]))
+
+            ik_q, ik_info = self.ik_solver.solve(
+                current_joint_q,
+                current_pose9d,
+                target_pose9d,
+            )
+            ik_joint_deg = np.rad2deg(np.asarray(ik_q, dtype=np.float64))
+            ik_delta_joint_deg = ik_joint_deg - current_joint_deg
+            predicted_wrench = raw_action[WFAM_CONTROL_WIDTH:WFAM_ACTION_WIDTH]
+
+            logging.info(
+                (
+                    "WFAM chunk %04d h%02d | abs_xyz_mm=%s abs_rpy_deg=%s | "
+                    "delta_world_mm=%s delta_local_mm=%s delta_rpy_deg=%s | "
+                    "grip_raw=%.3f wrench=%s | ik_q_deg=%s ik_dq_deg=%s | "
+                    "ik_pos_err=%.2fmm ik_rot_err=%.2fdeg success=%s"
+                ),
+                self.chunk_index,
+                horizon_index,
+                format_vector(target_xyz_mm),
+                format_vector(target_rpy_deg),
+                format_vector(delta_xyz_world_mm),
+                format_vector(delta_xyz_local_mm),
+                format_vector(delta_rpy_deg),
+                float(raw_action[9]),
+                format_vector(predicted_wrench, digits=3),
+                format_vector(ik_joint_deg),
+                format_vector(ik_delta_joint_deg),
+                float(ik_info.get("pos_error_m", math.nan)) * 1000.0,
+                math.degrees(float(ik_info.get("rot_error_rad", math.nan))),
+                bool(ik_info.get("success", False)),
+            )
+
+            if self.print_action_chunk_matrices:
+                logging.info(
+                    (
+                        "WFAM chunk %04d h%02d target_T_world:\n%s\n"
+                        "WFAM chunk %04d h%02d delta_T_current_to_target:\n%s"
+                    ),
+                    self.chunk_index,
+                    horizon_index,
+                    format_matrix4(target_transform),
+                    self.chunk_index,
+                    horizon_index,
+                    format_matrix4(delta_transform),
+                )
+
+            rows.append(
+                {
+                    "session_id": self.session_id,
+                    "chunk_index": self.chunk_index,
+                    "horizon_index": horizon_index,
+                    "current_xyz_mm": vector_to_json(current_xyz_mm),
+                    "current_rpy_deg": vector_to_json(current_rpy_deg),
+                    "current_joint_deg": vector_to_json(current_joint_deg),
+                    "raw_action": vector_to_json(raw_action),
+                    "target_T_world": matrix_to_json(target_transform),
+                    "target_xyz_mm": vector_to_json(target_xyz_mm),
+                    "target_rpy_deg": vector_to_json(target_rpy_deg),
+                    "delta_T_current_to_target": matrix_to_json(delta_transform),
+                    "delta_xyz_world_mm": vector_to_json(delta_xyz_world_mm),
+                    "delta_xyz_local_mm": vector_to_json(delta_xyz_local_mm),
+                    "delta_rpy_deg": vector_to_json(delta_rpy_deg),
+                    "target_delta_m": round(target_delta_m, 6),
+                    "gripper_raw": round(float(raw_action[9]), 6),
+                    "predicted_wrench": vector_to_json(predicted_wrench),
+                    "ik_joint_deg": vector_to_json(ik_joint_deg),
+                    "ik_delta_joint_deg": vector_to_json(ik_delta_joint_deg),
+                    "ik_info": {
+                        "success": bool(ik_info.get("success", False)),
+                        "iters": int(ik_info.get("iters", 0)),
+                        "pos_error_mm": round(float(ik_info.get("pos_error_m", math.nan)) * 1000.0, 6),
+                        "rot_error_deg": round(math.degrees(float(ik_info.get("rot_error_rad", math.nan))), 6),
+                        "clipped_target_delta_mm": round(
+                            float(ik_info.get("clipped_target_delta_m", math.nan)) * 1000.0,
+                            6,
+                        ),
+                    },
+                }
+            )
+
+        if self.dump_action_chunks:
+            dump_dir = self.action_chunk_dump_dir
+            if dump_dir is None:
+                dump_dir = Path("runs") / "wfam_action_chunks"
+                self.action_chunk_dump_dir = dump_dir
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            dump_path = dump_dir / f"chunk_{self.chunk_index:04d}.jsonl"
+            with open(dump_path, "w") as file:
+                for row in rows:
+                    file.write(json.dumps(row, sort_keys=True) + "\n")
+            logging.info("Wrote WFAM decoded action chunk debug: %s", dump_path)
 
 
 def execution_trace_fieldnames() -> list[str]:
@@ -736,6 +928,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cam-height", type=int, default=160)
     parser.add_argument("--video-dir", type=Path, default=None)
     parser.add_argument("--trace-dir", type=Path, default=None)
+    parser.add_argument(
+        "--dump-action-chunks",
+        action="store_true",
+        help=(
+            "Decode every received WFAM chunk into 24 human-readable actions. "
+            "Writes JSONL under trace/action_chunks and logs a compact mm/degree table."
+        ),
+    )
+    parser.add_argument(
+        "--action-chunk-dump-dir",
+        type=Path,
+        default=None,
+        help="Override the directory for --dump-action-chunks JSONL files.",
+    )
+    parser.add_argument(
+        "--print-action-chunk-matrices",
+        action="store_true",
+        help="Also print full 4x4 target and delta transformation matrices for every action.",
+    )
     parser.add_argument("--lock-gripper-close", action="store_true")
     parser.add_argument("--latch-gripper-after-close", action="store_true")
     parser.add_argument("--no-save-video", action="store_true")
@@ -870,8 +1081,16 @@ def main() -> None:
         execution_mode=args.execution_mode,
         allow_missing_ee_pose=args.allow_missing_ee_pose,
         ik_solver=ik_solver,
+        dump_action_chunks=args.dump_action_chunks,
+        print_action_chunk_matrices=args.print_action_chunk_matrices,
+        action_chunk_dump_dir=args.action_chunk_dump_dir,
     )
     logging.info("WFAM execution trace CSV: %s", trace_dir / "execution_trace_wfam.csv")
+    if args.dump_action_chunks:
+        logging.info(
+            "WFAM decoded action chunk dumps: %s",
+            args.action_chunk_dump_dir or (trace_dir / "action_chunks"),
+        )
     if args.execution_mode == "hold-joint":
         logging.warning(
             "WFAM execution-mode=hold-joint: model outputs are logged, but the old "

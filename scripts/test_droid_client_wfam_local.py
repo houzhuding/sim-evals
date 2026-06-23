@@ -104,6 +104,9 @@ def make_client(fake_server: FakeWFAMPolicyServerClient) -> SimDroidWFAMPolicyCl
     client.execution_mode = "ik-joint"
     client.allow_missing_ee_pose = False
     client.ik_solver = FrankaPose9DIKSolver(max_iters=2)
+    client.dump_action_chunks = False
+    client.print_action_chunk_matrices = False
+    client.action_chunk_dump_dir = None
     client.gripper_latched_closed = False
     client.session_id = str(uuid.uuid4())
     client.pred_action_chunk = None
